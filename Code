@@ -1,0 +1,899 @@
+"""
+3D-визуализация квадрокоптера: Accel|Gyro (+KG, +Battery), Mahony, SLERP,
+HUD, история, "моторы", индикатор батареи (правый верх), логотипы (правый низ).
+
+Поддерживает:
+  1) Одна строка от Pico:
+     "Accel: (...) | Gyro: (...) | KG: ... | VBAT: ... | SOC: ... | STATE: ..."
+  2) Отдельные строки батареи, например:
+     "Vbat = 1.97 V [###-----] 63.2%  [OK]"
+"""
+
+import serial, serial.tools.list_ports, threading
+import collections, time, math, re, pyglet
+from pyglet.gl import Config
+from OpenGL.GL import *
+from OpenGL.GLU import gluPerspective
+
+# ---------- [02] MahonyAHRS ----------
+class MahonyAHRS:
+    def __init__(self, Kp=2.2, Ki=0.05):
+        self.q0, self.q1, self.q2, self.q3 = 1.0, 0.0, 0.0, 0.0
+        self.Kp = Kp
+        self.Ki = Ki
+        self.exInt = 0.0
+        self.eyInt = 0.0
+        self.ezInt = 0.0
+
+    def update_imu(self, gx, gy, gz, ax, ay, az, dt):
+        norm = math.sqrt(ax*ax + ay*ay + az*az)
+        if norm == 0.0:
+            self._integrate(gx, gy, gz, dt); return
+        ax /= norm; ay /= norm; az /= norm
+        q0,q1,q2,q3 = self.q0, self.q1, self.q2, self.q3
+        vx = 2.0*(q1*q3 - q0*q2)
+        vy = 2.0*(q0*q1 + q2*q3)
+        vz = q0*q0 - q1*q1 - q2*q2 + q3*q3
+        ex = (ay*vz - az*vy)
+        ey = (az*vx - ax*vz)
+        ez = (ax*vy - ay*vx)
+        self.exInt += ex * self.Ki * dt
+        self.eyInt += ey * self.Ki * dt
+        self.ezInt += ez * self.Ki * dt
+        gx += self.Kp * ex + self.exInt
+        gy += self.Kp * ey + self.eyInt
+        gz += self.Kp * ez + self.ezInt
+        self._integrate(gx, gy, gz, dt)
+
+    def _integrate(self, gx, gy, gz, dt):
+        q0,q1,q2,q3 = self.q0, self.q1, self.q2, self.q3
+        qDot0 = 0.5 * (-q1*gx - q2*gy - q3*gz)
+        qDot1 = 0.5 * ( q0*gx + q2*gz - q3*gy)
+        qDot2 = 0.5 * ( q0*gy - q1*gz + q3*gx)
+        qDot3 = 0.5 * ( q0*gz + q1*gy - q2*gx)
+        q0 += qDot0 * dt; q1 += qDot1 * dt; q2 += qDot2 * dt; q3 += qDot3 * dt
+        inv = 1.0 / math.sqrt(q0*q0 + q1*q1 + q2*q2 + q3*q3)
+        self.q0, self.q1, self.q2, self.q3 = q0*inv, q1*inv, q2*inv, q3*inv
+
+    def quat(self): return self.q0, self.q1, self.q2, self.q3
+
+
+# ---------- [03] Настройки и состояния ----------
+PORT = 15                 # <-- если нужно, поменяй на свой COM
+BAUD = 115200
+PREFERRED_PORT = f"COM{PORT}"
+
+RPM_MIN = 3000.0
+RPM_MAX = 52500.0
+DYN_IDLE_K = 40.0
+DYN_IDLE_CLAMP = 4000.0
+
+DEADBAND_X = 0.6
+DEADBAND_Y = 1.5
+DEADBAND_Z = 0.8
+
+ST_GMAG_TAU  = 0.15
+ST_AERR_TAU  = 0.20
+ST_GMAG_THR  = 0.6
+ST_AERR_THR  = 0.20*9.81
+
+ST_DWELL_SEC   = 1.20
+ST_SETTLE_SEC  = 0.45
+
+AX_GUARD_XZ   = 0.30
+PITCH_ERR_MAX = 1.2
+
+RECENTER_DELAY = 1.00
+RECENTER_RATE  = 1.20
+
+KP_ACTIVE = 2.6
+KP_QUIET  = 1.2
+KI_BASE   = 0.05
+
+USE_YAW = True
+AUTOLEVEL_ENABLED = False
+AUTOLEVEL_GAIN = 0.35
+
+q_ref = (1.0, 0.0, 0.0, 0.0)
+yaw_zero = roll_zero = pitch_zero = 0.0
+
+frame_counter = 0
+frame_last = time.time()
+fps_render = 0.0
+fps_data = 0.0
+lines_received = 0
+lines_last = time.time()
+
+lines = collections.deque(maxlen=500)
+run_reader = True
+
+ahrs = MahonyAHRS(Kp=KP_QUIET, Ki=KI_BASE)
+last_ts = None
+
+bx = by = bz = 0.0
+
+ETA_Q_X = 1.2
+ETA_Q_Y = 3.5
+ETA_Q_Z = 1.0
+
+ETA_M_X = 0.05
+ETA_M_Y_TINY = 0.003
+ETA_M_Z = 0.05
+
+gx_dps_glob = gy_dps_glob = gz_dps_glob = 0.0
+
+gmag_lpf = 0.0
+aerr_lpf = 0.0
+
+stationary_state = False
+still_timer = 0.0
+settle_timer = 0.0
+
+CAL_TIME = 3.0
+calib_active = False
+calib_t = 0.0
+cal_gx = cal_gy = cal_gz = 0.0
+cal_n = 0
+
+force_latest = None   # KG
+vbat_latest  = None   # Вольты
+soc_latest   = None   # %
+batt_state   = None   # "OK"/"LOW"/"CRITICAL" и т.п.
+
+# Плавная визуализация (SLERP)
+q_vis = (1.0, 0.0, 0.0, 0.0)  # то, что рисуем
+last_frame_time = time.time()
+SMOOTH_HZ = 12.0              # 10..20 — комфортно
+
+
+# ---------- [04] Вспомогательные ----------
+def quat_conj(q): w,x,y,z = q; return (w, -x, -y, -z)
+
+def quat_mul(a, b):
+    aw,ax,ay,az = a; bw,bx,by,bz = b
+    return (
+        aw*bw - ax*bx - ay*by - az*bz,
+        aw*bx + ax*bw + ay*bz - az*by,
+        aw*by - ax*bz + ay*bw + az*bx,
+        aw*bz + ax*by - ay*bx + az*bw
+    )
+
+def quat_norm(q):
+    w,x,y,z = q
+    inv = 1.0 / math.sqrt(w*w + x*x + y*y + z*z)
+    return (w*inv, x*inv, y*inv, z*inv)
+
+def quat_to_gl_matrix(q0,q1,q2,q3):
+    m00 = 1 - 2*(q2*q2 + q3*q3); m01 = 2*(q1*q2 - q0*q3); m02 = 2*(q1*q3 + q0*q2)
+    m10 = 2*(q1*q2 + q0*q3);     m11 = 1 - 2*(q1*q1 + q3*q3); m12 = 2*(q2*q3 - q0*q1)
+    m20 = 2*(q1*q3 - q0*q2);     m21 = 2*(q2*q3 + q0*q1);     m22 = 1 - 2*(q1*q1 + q2*q2)
+    return (GLfloat * 16)(
+        m00, m10, m20, 0.0,
+        m01, m11, m21, 0.0,
+        m02, m12, m22, 0.0,
+        0.0,  0.0,  0.0, 1.0
+    )
+
+def quat_to_euler_deg(q):
+    w,x,y,z = q
+    siny_cosp = 2.0*(w*z + x*y); cosy_cosp = 1.0 - 2.0*(y*y + z*z)
+    yaw = math.degrees(math.atan2(siny_cosp, cosy_cosp))
+    sinp = 2.0*(w*y - z*x)
+    pitch = math.degrees(math.copysign(math.pi/2, sinp)) if abs(sinp)>=1.0 else math.degrees(math.asin(sinp))
+    sinr_cosp = 2.0*(w*x + y*z); cosr_cosp = 1.0 - 2.0*(x*x + y*y)
+    roll = math.degrees(math.atan2(sinr_cosp, cosr_cosp))
+    return roll, pitch, yaw
+
+def euler_deg_to_quat(roll, pitch, yaw):
+    cr = math.cos(math.radians(roll)*0.5); sr = math.sin(math.radians(roll)*0.5)
+    cp = math.cos(math.radians(pitch)*0.5); sp = math.sin(math.radians(pitch)*0.5)
+    cy = math.cos(math.radians(yaw)*0.5);   sy = math.sin(math.radians(yaw)*0.5)
+    w = cy*cp*cr + sy*sp*sr
+    x = cy*cp*sr - sy*sp*cr
+    y = sy*cp*sr + cy*sp*cr
+    z = sy*cp*cr - cy*sp*sr
+    return (w,x,y,z)
+
+def wrap_angle_deg(a): return (a + 180.0) % 360.0 - 180.0
+
+def accel_to_rp_deg(ax, ay, az):
+    roll_acc  = math.degrees(math.atan2(ay, az))
+    pitch_acc = math.degrees(math.atan2(-ax, (ay*ay + az*az)**0.5))
+    return roll_acc, pitch_acc
+
+def quat_slerp(q1, q2, t):
+    w1,x1,y1,z1 = q1
+    w2,x2,y2,z2 = q2
+    cos_omega = w1*w2 + x1*x2 + y1*y2 + z1*z2
+    if cos_omega < 0.0:
+        w2,x2,y2,z2 = -w2,-x2,-y2,-z2
+        cos_omega = -cos_omega
+    if cos_omega > 0.9995:
+        w = w1 + t*(w2 - w1); x = x1 + t*(x2 - x1)
+        y = y1 + t*(y2 - y1); z = z1 + t*(z2 - z1)
+        return quat_norm((w,x,y,z))
+    omega = math.acos(max(min(cos_omega,1.0),-1.0))
+    sin_omega = math.sin(omega)
+    k1 = math.sin((1.0 - t)*omega) / sin_omega
+    k2 = math.sin(t*omega) / sin_omega
+    return (w1*k1 + w2*k2, x1*k1 + x2*k2, y1*k1 + y2*k2, z1*k1 + z2*k2)
+
+def choose_font():
+    for name in ["Segoe UI","DejaVu Sans Mono","Consolas","Arial","Courier New"]:
+        try:
+            if pyglet.font.have_font(name): return name
+        except Exception: pass
+    return "Arial"
+
+def open_serial():
+    while run_reader:
+        try:
+            s = serial.Serial(PREFERRED_PORT, BAUD, timeout=0)
+            time.sleep(0.2); return s
+        except serial.SerialException:
+            time.sleep(1.0)
+
+def serial_reader():
+    global lines, lines_received, fps_data, lines_last
+    ser = open_serial(); buf = ""
+    while run_reader:
+        try:
+            chunk = ser.read(ser.in_waiting or 1).decode("utf-8", errors="ignore")
+            if chunk:
+                buf += chunk
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    line = line.strip()
+                    if line:
+                        lines.append(line); lines_received += 1
+            else:
+                time.sleep(0.001)
+            now = time.time()
+            if now - lines_last >= 1.0:
+                fps_data = lines_received / (now - lines_last)
+                lines_received = 0; lines_last = now
+        except (serial.SerialException, OSError):
+            try: ser.close()
+            except: pass
+            ser = open_serial()
+
+
+# ---------- [05] Примитивы и сетка-фон ----------
+def draw_cube(size=1.0, color=(0.2,0.2,1.0)):
+    glColor3f(*color); s=size/2.0
+    tris=[(-s,-s,-s,  s,-s,-s,  s, s,-s), (-s,-s,-s,  s, s,-s, -s, s,-s),
+          (-s,-s, s,  s, s, s,  s,-s, s), (-s,-s, s, -s, s, s,  s, s, s),
+          (-s,-s,-s, -s, s, s, -s, s,-s), (-s,-s,-s, -s,-s, s, -s, s, s),
+          ( s,-s,-s,  s, s,-s,  s, s, s), ( s,-s,-s,  s, s, s,  s,-s, s),
+          (-s, s,-s,  s, s,-s,  s, s, s), (-s, s,-s,  s, s, s, -s, s, s),
+          (-s,-s,-s,  s,-s, s,  s,-s,-s), (-s,-s,-s, -s,-s, s,  s,-s, s)]
+    glBegin(GL_TRIANGLES)
+    for t in tris:
+        glVertex3f(*t[0:3]); glVertex3f(*t[3:6]); glVertex3f(*t[6:9])
+    glEnd()
+
+def draw_cylinder(radius=0.1, length=6.0, color=(1.0,0.0,0.0), slices=24):
+    glColor3f(*color); half=length/2.0; step=2.0*math.pi/slices
+    glBegin(GL_TRIANGLES)
+    for i in range(slices):
+        a=i*step; b=(i+1)*step
+        x1,z1=radius*math.cos(a),radius*math.sin(a)
+        x2,z2=radius*math.cos(b),radius*math.sin(b)
+        glVertex3f(x1,-half,z1); glVertex3f(x2,-half,z2); glVertex3f(x2,half,z2)
+        glVertex3f(x1,-half,z1); glVertex3f(x2,half,z2); glVertex3f(x1,half,z1)
+    glEnd()
+
+def draw_disc(radius=1.2, color=(0.0,1.0,0.0), segments=64):
+    glColor3f(*color)
+    glBegin(GL_TRIANGLE_FAN)
+    glVertex3f(0.0,0.0,0.0)
+    for i in range(segments+1):
+        a=2.0*math.pi*i/segments
+        glVertex3f(radius*math.cos(a),0.0,radius*math.sin(a))
+    glEnd()
+
+def draw_grid_background():
+    glDisable(GL_DEPTH_TEST)
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
+    glOrtho(0, window.width, 0, window.height, -1, 1)
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+    glColor3f(0,0,0)
+    glBegin(GL_QUADS)
+    glVertex2f(0,0); glVertex2f(window.width,0); glVertex2f(window.width,window.height); glVertex2f(0,window.height)
+    glEnd()
+    glColor3f(0.0, 0.4, 0.0)
+    glLineWidth(1.0)
+    step = 32
+    glBegin(GL_LINES)
+    for x in range(0, window.width+1, step):
+        glVertex2f(x, 0); glVertex2f(x, window.height)
+    for y in range(0, window.height+1, step):
+        glVertex2f(0, y); glVertex2f(window.width, y)
+    glEnd()
+    glPopMatrix()
+    glMatrixMode(GL_PROJECTION); glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+    glEnable(GL_DEPTH_TEST)
+
+
+# ---------- [06] История и «моторы» ----------
+HIST_SEC = 10.0
+hist = collections.deque()
+HIST_PAUSED = False
+
+def push_history(t, r, p, y):
+    hist.append((t, r, p, y))
+    t_min = t - HIST_SEC
+    while hist and hist[0][0] < t_min:
+        hist.popleft()
+
+mot_hist = collections.deque()
+def push_motor_history(t, m_rpm):
+    mot_hist.append((t, *m_rpm))
+    t_min = t - HIST_SEC
+    while mot_hist and mot_hist[0][0] < t_min:
+        mot_hist.popleft()
+
+def clamp01(x): return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
+
+def mixer_from_angles_rpm(roll, pitch, yaw, dyn_idle_rpm):
+    r = max(-1.0, min(1.0, roll  / 30.0))
+    p = max(-1.0, min(1.0, pitch / 30.0))
+    y = max(-1.0, min(1.0, yaw   / 90.0))
+    thrust = 0.20
+    kr, kp, ky = 0.12, 0.12, 0.08
+    mFR = thrust + (-kp*p) + (-kr*r) + (+ky*y)
+    mFL = thrust + (-kp*p) + (+kr*r) + (-ky*y)
+    mRL = thrust + (+kp*p) + (+kr*r) + (+ky*y)
+    mRR = thrust + (+kp*p) + (-kr*r) + (-ky*y)
+    m = [clamp01(v) for v in (mFR, mFL, mRL, mRR)]
+    span = max(0.0, RPM_MAX - dyn_idle_rpm)
+    return [dyn_idle_rpm + (span * math.sqrt(v)) for v in m]
+
+pause_btn_rect = [0,0,0,0]
+
+
+# ---------- [07] Окно, HUD ----------
+config = Config(double_buffer=True, depth_size=24)
+window = pyglet.window.Window(1200, 900, "Quadcopter Visualization", resizable=True, config=config)
+window.set_vsync(True)
+
+HUD_FONT = choose_font(); HUD_SIZE = 17
+hud_label = pyglet.text.Label(
+    '', x=0, y=0, anchor_x="left", anchor_y="top",
+    font_name=HUD_FONT, font_size=HUD_SIZE,
+    color=(0,255,0,255), multiline=True, width=580
+)
+pause_label = pyglet.text.Label(
+    '', x=0, y=0, anchor_x="center", anchor_y="top",
+    font_name=HUD_FONT, font_size=14,
+    color=(0, 255, 0, 255)
+)
+
+# --- ЛОГОТИПЫ (правый нижний угол) ---
+LOGO1_PATH = r"C:\Users\User\OneDrive\Рабочий стол\лого.jpg"
+LOGO2_PATH = r"C:\Users\User\OneDrive\Рабочий стол\Логотип.png"
+try: logo1_img=pyglet.image.load(LOGO1_PATH)
+except: logo1_img=None
+try: logo2_img=pyglet.image.load(LOGO2_PATH)
+except: logo2_img=None
+logo1_sprite=pyglet.sprite.Sprite(logo1_img) if logo1_img else None
+logo2_sprite=pyglet.sprite.Sprite(logo2_img) if logo2_img else None
+if logo1_sprite: logo1_sprite.scale = 64.0/float(logo1_sprite.image.height)
+if logo2_sprite: logo2_sprite.scale = 64.0/float(logo2_sprite.image.height)
+
+def draw_logos_bottom_right():
+    if (logo1_sprite is None) and (logo2_sprite is None): return
+    margin=14; gap=8
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity(); glOrtho(0,window.width,0,window.height,-1,1)
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity(); glDisable(GL_DEPTH_TEST)
+    y=margin
+    if logo2_sprite:
+        logo2_sprite.x=window.width-margin-logo2_sprite.width
+        logo2_sprite.y=y; logo2_sprite.draw(); y+=logo2_sprite.height+gap
+    if logo1_sprite:
+        logo1_sprite.x=window.width-margin-logo1_sprite.width
+        logo1_sprite.y=y; logo1_sprite.draw()
+    glEnable(GL_DEPTH_TEST); glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW)
+
+# --- Индикатор батареи (правый верх, под панелью истории НЕ пересекается) ---
+def draw_battery_panel():
+    margin, pad = 14, 10
+    box_w, box_h = 320, 90
+    # панель истории занимает верх-право; батарейную опускаем на 270px ниже верха
+    x2 = window.width - margin
+    y2 = window.height - margin - 270
+    x1 = x2 - box_w
+    y1 = y2 - box_h
+
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
+    glOrtho(0, window.width, 0, window.height, -1, 1)
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+    glDisable(GL_DEPTH_TEST)
+
+    # фон + рамка
+    glColor3f(0.05,0.05,0.05)
+    glBegin(GL_QUADS)
+    glVertex2f(x1,y1); glVertex2f(x2,y1); glVertex2f(x2,y2); glVertex2f(x1,y2)
+    glEnd()
+    glColor3f(0,1,0); glLineWidth(2.0)
+    glBegin(GL_LINE_LOOP)
+    glVertex2f(x1,y1); glVertex2f(x2,y1); glVertex2f(x2,y2); glVertex2f(x1,y2)
+    glEnd()
+
+    vb = ("{:.3f} V".format(vbat_latest) if vbat_latest is not None else "—")
+    sc = ("{:.1f}%".format(soc_latest)   if soc_latest  is not None else "—")
+    st = (batt_state if batt_state else "—")
+    pyglet.text.Label(f"VBAT: {vb}   SOC: {sc}   STATE: {st}",
+                      x=x1+pad, y=y2-pad, anchor_x="left", anchor_y="top",
+                      font_name=HUD_FONT, font_size=14, color=(0,255,0,255)).draw()
+
+    # полоса процента
+    bar_x1=x1+pad; bar_x2=x2-pad; bar_y1=y1+pad+6; bar_y2=bar_y1+14
+    glColor3f(0,1,0); glBegin(GL_LINE_LOOP)
+    glVertex2f(bar_x1,bar_y1); glVertex2f(bar_x2,bar_y1)
+    glVertex2f(bar_x2,bar_y2); glVertex2f(bar_x1,bar_y2)
+    glEnd()
+    if soc_latest is not None:
+        q=max(0.0,min(100.0,soc_latest))/100.0
+        fill_x=bar_x1+q*(bar_x2-bar_x1)
+        glColor3f(0.0,0.6,0.0)
+        glBegin(GL_QUADS)
+        glVertex2f(bar_x1,bar_y1); glVertex2f(fill_x,bar_y1)
+        glVertex2f(fill_x,bar_y2); glVertex2f(bar_x1,bar_y2)
+        glEnd()
+
+    glEnable(GL_DEPTH_TEST)
+    glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW)
+
+
+HUD_TEXT = ""
+
+@window.event
+def on_resize(w,h):
+    if h==0: h=1
+    glViewport(0,0,w,h)
+    glMatrixMode(GL_PROJECTION); glLoadIdentity()
+    gluPerspective(60.0, w/float(h), 0.1, 100.0)
+    glMatrixMode(GL_MODELVIEW)
+    return pyglet.event.EVENT_HANDLED
+
+
+# ---------- [08] Рендер сцены ----------
+def draw_quadcopter_quat(q_disp):
+    glPushMatrix()
+    M = quat_to_gl_matrix(*q_disp)
+    glMultMatrixf(M)
+    draw_cube(1.0)
+    glPushMatrix(); glRotatef(90,0,1,0); draw_cylinder(); glPopMatrix()
+    glPushMatrix(); draw_cylinder(); glPopMatrix()
+    for (x,z) in [(3,3),(-3,3),(-3,-3),(3,-3)]:
+        glPushMatrix(); glTranslatef(x,0,z); draw_disc(radius=1.2); glPopMatrix()
+    glPopMatrix()
+
+def draw_history_panel():
+    global pause_btn_rect, pause_label
+    margin, pad = 14, 10
+    box_w, box_h = 560, 260
+    x2 = window.width - margin
+    y2 = window.height - margin
+    x1 = x2 - box_w
+    y1 = y2 - box_h
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
+    glOrtho(0, window.width, 0, window.height, -1, 1)
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+    glDisable(GL_DEPTH_TEST)
+    glColor3f(0.05, 0.05, 0.05)
+    glBegin(GL_QUADS)
+    glVertex2f(x1, y1); glVertex2f(x2, y1); glVertex2f(x2, y2); glVertex2f(x1, y2)
+    glEnd()
+    glColor3f(0,1,0); glLineWidth(2.0)
+    glBegin(GL_LINE_LOOP)
+    glVertex2f(x1, y1); glVertex2f(x2, y1); glVertex2f(x2, y2); glVertex2f(x1, y2)
+    glEnd()
+    gx1, gy1 = x1 + pad, y1 + pad + 34
+    gx2, gy2 = x2 - pad, y2 - pad
+    glColor3f(0.0, 0.3, 0.0); glLineWidth(1.0)
+    glBegin(GL_LINES)
+    for i in range(11):
+        x = gx1 + (gx2 - gx1) * i / 10.0
+        glVertex2f(x, gy1); glVertex2f(x, gy2)
+    for val in range(-90, 91, 30):
+        y = gy1 + (val + 90.0) / 180.0 * (gy2 - gy1)
+        glVertex2f(gx1, y); glVertex2f(gx2, y)
+    glEnd()
+    if len(hist) >= 2:
+        t_now = hist[-1][0]
+        t_start = t_now - HIST_SEC
+        def to_xy(t, ang):
+            xr = (t - t_start) / HIST_SEC
+            xr = 0.0 if xr < 0.0 else (1.0 if xr > 1.0 else xr)
+            x = gx1 + xr * (gx2 - gx1)
+            a = max(-90.0, min(90.0, ang))
+            y = gy1 + (a + 90.0) / 180.0 * (gy2 - gy1)
+            return x, y
+        def draw_curve(idx, color):
+            glColor3f(*color)
+            glBegin(GL_LINE_STRIP)
+            for t,r,p,y in hist:
+                ang = r if idx==0 else (p if idx==1 else y)
+                X,Y = to_xy(t, ang)
+                glVertex2f(X, Y)
+            glEnd()
+        draw_curve(0, (0.0, 1.0, 0.0))
+        draw_curve(1, (0.0, 0.8, 1.0))
+        draw_curve(2, (1.0, 0.9, 0.1))
+    btn_w, btn_h = 120, 26
+    bx1 = gx1; by1 = y1 + pad; bx2 = bx1 + btn_w; by2 = by1 + btn_h
+    pause_btn_rect[:] = [bx1, by1, bx2, by2]
+    glColor3f(0.12, 0.12, 0.12)
+    glBegin(GL_QUADS)
+    glVertex2f(bx1, by1); glVertex2f(bx2, by1); glVertex2f(bx2, by2); glVertex2f(bx1, by2)
+    glEnd()
+    glColor3f(0,1,0); glLineWidth(2.0)
+    glBegin(GL_LINE_LOOP)
+    glVertex2f(bx1, by1); glVertex2f(bx2, by1); glVertex2f(bx2, by2); glVertex2f(bx1, by2)
+    glEnd()
+    pause_label.text = "History: PAUSED" if HIST_PAUSED else "History: RUNNING"
+    pause_label.x = (x1 + x2) * 0.5
+    pause_label.y = y1 - 8
+    pause_label.draw()
+    glEnable(GL_DEPTH_TEST)
+    glPopMatrix()
+    glMatrixMode(GL_PROJECTION); glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+
+def draw_motor_panel(dyn_idle_rpm):
+    margin, pad = 14, 10
+    box_w, box_h = 560, 200
+    x1 = margin; y1 = margin; x2 = x1 + box_w; y2 = y1 + box_h
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
+    glOrtho(0, window.width, 0, window.height, -1, 1)
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+    glDisable(GL_DEPTH_TEST)
+    glColor3f(0.05, 0.05, 0.05)
+    glBegin(GL_QUADS)
+    glVertex2f(x1, y1); glVertex2f(x2, y1); glVertex2f(x2, y2); glVertex2f(x1, y2)
+    glEnd()
+    glColor3f(0,1,0); glLineWidth(2.0)
+    glBegin(GL_LINE_LOOP)
+    glVertex2f(x1, y1); glVertex2f(x2, y1); glVertex2f(x2, y2); glVertex2f(x1, y2)
+    glEnd()
+    gx1, gy1 = x1 + pad, y1 + pad + 20
+    gx2, gy2 = x2 - pad, y2 - pad
+    glColor3f(0.0, 0.3, 0.0); glLineWidth(1.0)
+    glBegin(GL_LINES)
+    for i in range(11):
+        x = gx1 + (gx2 - gx1) * i / 10.0
+        glVertex2f(x, gy1); glVertex2f(x, gy2)
+    for val in (0, 15000, 30000, 45000, int(RPM_MAX)):
+        y = gy1 + ((val - RPM_MIN) / (RPM_MAX - RPM_MIN)) * (gy2 - gy1)
+        glVertex2f(gx1, y); glVertex2f(gx2, y)
+    glEnd()
+    if len(mot_hist) >= 2:
+        t_now = mot_hist[-1][0]
+        t_start = t_now - HIST_SEC
+        def to_xy(t, val):
+            xr = (t - t_start) / HIST_SEC
+            xr = 0.0 if xr < 0.0 else (1.0 if xr > 1.0 else xr)
+            x = gx1 + xr * (gx2 - gx1)
+            v = max(0.0, min(RPM_MAX, val))
+            y = gy1 + ((v - RPM_MIN) / (RPM_MAX - RPM_MIN)) * (gy2 - gy1)
+            return x, y
+        def draw_curve(selector, color):
+            glColor3f(*color)
+            glBegin(GL_LINE_STRIP)
+            for t,m1,m2,m3,m4 in mot_hist:
+                v = (m1,m2,m3,m4)[selector]
+                X,Y = to_xy(t, v)
+                glVertex2f(X, Y)
+            glEnd()
+        draw_curve(0, (1.0, 0.3, 0.3))
+        draw_curve(1, (0.3, 1.0, 0.3))
+        draw_curve(2, (0.3, 0.6, 1.0))
+        draw_curve(3, (1.0, 1.0, 0.2))
+    glEnable(GL_DEPTH_TEST)
+    glPopMatrix()
+    glMatrixMode(GL_PROJECTION); glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+
+
+@window.event
+def on_draw():
+    global frame_counter, frame_last, fps_render, HUD_TEXT, q_vis, last_frame_time
+
+    window.clear()
+    draw_grid_background()
+
+    glEnable(GL_DEPTH_TEST)
+    glClear(GL_DEPTH_BUFFER_BIT)
+    glLoadIdentity()
+    glTranslatef(0.0, -1.5, -18.0)
+
+    # Кватернион цели
+    q_curr = ahrs.quat()
+    q_rel  = quat_norm(quat_mul(quat_conj(q_ref), q_curr))
+    q_zero = euler_deg_to_quat(roll_zero, pitch_zero, (yaw_zero if USE_YAW else 0.0))
+    q_target = quat_norm(quat_mul(quat_conj(q_zero), q_rel))
+
+    # Межкадровая плавность (SLERP)
+    nowf = time.time()
+    dtf = nowf - last_frame_time
+    last_frame_time = nowf
+    alpha = 1.0 - math.exp(-SMOOTH_HZ * max(dtf, 1e-4))
+    alpha = min(alpha, 0.25)  # ограничим резкий скачок
+    q_vis = quat_slerp(q_vis, q_target, alpha)
+
+    # Рисуем плавную позу
+    draw_quadcopter_quat(q_vis)
+
+    # FPS
+    frame_counter += 1
+    now = time.time()
+    if now - frame_last >= 1.0:
+        fps_render = frame_counter / (now - frame_last)
+        frame_counter = 0; frame_last = now
+
+    # Углы из q_vis
+    r_txt, p_txt, z_txt = quat_to_euler_deg(q_vis)
+    r_txt = wrap_angle_deg(r_txt); p_txt = wrap_angle_deg(p_txt)
+    if not USE_YAW: z_txt = 0.0
+    else: z_txt = wrap_angle_deg(z_txt)
+
+    # истории
+    dyn_idle = RPM_MIN + min(DYN_IDLE_CLAMP, DYN_IDLE_K * abs(gz_dps_glob))
+    if not HIST_PAUSED:
+        push_history(now, r_txt, p_txt, z_txt)
+        push_motor_history(now, mixer_from_angles_rpm(r_txt, p_txt, z_txt, dyn_idle))
+
+    auto = "ON" if AUTOLEVEL_ENABLED else "OFF"
+    kg_txt = ("{:.3f} kg".format(force_latest) if force_latest is not None else "—")
+
+    HUD_TEXT = (
+        f"X: {r_txt:7.2f}°\n"
+        f"Y: {p_txt:7.2f}°\n"
+        f"Z: {z_txt:7.2f}°\n"
+        f"KG: {kg_txt}\n"
+        f"G(dps): gx={gx_dps_glob:6.2f} gy={gy_dps_glob:6.2f} gz={gz_dps_glob:6.2f}\n"
+        f"Bias(dps): bx={bx:5.2f} by={by:5.2f} bz={bz:5.2f}\n"
+        f"Data: {fps_data:5.1f} Hz   FPS: {fps_render:5.1f}   AutoLevel:{auto}\n"
+        f"[V] zero ALL   [R] zero Z   [T] zero X/Y   [C] quick CAL   [L] toggle AutoLevel   [P] pause history"
+    )
+
+    # HUD рамка и текст
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
+    glOrtho(0, window.width, 0, window.height, -1, 1)
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+    glDisable(GL_DEPTH_TEST)
+    margin, pad = 14, 10
+    box_w, box_h = 580, 250
+    x1, y1 = margin,            window.height - margin
+    x2, y2 = margin + box_w,    window.height - margin - box_h
+    glColor3f(0,1,0); glLineWidth(2.0)
+    glBegin(GL_LINE_LOOP)
+    glVertex2f(x1,y1); glVertex2f(x2,y1); glVertex2f(x2,y2); glVertex2f(x1,y2)
+    glEnd()
+    hud_label.x = margin + 10
+    hud_label.y = window.height - margin - 10
+    hud_label.text = HUD_TEXT
+    hud_label.draw()
+    glEnable(GL_DEPTH_TEST)
+    glPopMatrix()
+    glMatrixMode(GL_PROJECTION); glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+
+    # Панели
+    draw_history_panel()
+    draw_battery_panel()
+    draw_motor_panel(dyn_idle)
+    draw_logos_bottom_right()
+
+
+# ---------- [09] События ----------
+@window.event
+def on_key_press(symbol, modifiers):
+    from pyglet.window import key
+    global yaw_zero, roll_zero, pitch_zero, q_ref
+    global calib_active, calib_t, cal_gx, cal_gy, cal_gz, cal_n, AUTOLEVEL_ENABLED, HIST_PAUSED
+    if symbol == key.V:
+        q_ref = quat_norm(ahrs.quat())
+        yaw_zero = roll_zero = pitch_zero = 0.0
+    elif symbol == key.R:
+        q_rel = quat_norm(quat_mul(quat_conj(q_ref), ahrs.quat()))
+        _, _, y_rel = quat_to_euler_deg(q_rel)
+        yaw_zero = y_rel
+    elif symbol == key.T:
+        q_rel = quat_norm(quat_mul(quat_conj(q_ref), ahrs.quat()))
+        r_rel, p_rel, _ = quat_to_euler_deg(q_rel)
+        roll_zero  = r_rel
+        pitch_zero = p_rel
+    elif symbol == key.C:
+        calib_active = True
+        calib_t = 0.0; cal_gx = cal_gy = cal_gz = 0.0; cal_n = 0
+    elif symbol == key.L:
+        AUTOLEVEL_ENABLED = not AUTOLEVEL_ENABLED
+    elif symbol == key.P:
+        HIST_PAUSED = not HIST_PAUSED
+
+@window.event
+def on_mouse_press(x, y, button, modifiers):
+    global HIST_PAUSED
+    x1,y1,x2,y2 = pause_btn_rect
+    if x1 <= x <= x2 and y1 <= y <= y2:
+        HIST_PAUSED = not HIST_PAUSED
+
+
+# ---------- [10] Парсер и апдейт ----------
+# Регулярки для батареи (и отдельной строкой, и в составе основной)
+vb_re  = re.compile(r'(?:VBAT|Vbat)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)', re.IGNORECASE)
+soc_re = re.compile(r'(?:SOC)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)', re.IGNORECASE)
+pct_re = re.compile(r'([0-9]+(?:\.[0-9]+)?)\s*%')
+st1_re = re.compile(r'(?:STATE)\s*[:=]\s*([A-Za-z]+)', re.IGNORECASE)
+st2_re = re.compile(r'\[([A-Za-z]+)\]')
+
+def parse_main_line(line):
+    """Возвращает (ax,ay,az,gx,gy,gz,kg, vbat,soc,state) или None"""
+    if not line.startswith("Accel"): return None
+    parts=[p.strip() for p in line.split("|")]
+    ax=ay=az=gx=gy=gz=None; kg=None; vbat=None; soc=None; state=None
+    for p in parts:
+        pl=p.lower()
+        if pl.startswith("accel"):
+            vec=p.split(":",1)[1].strip(); ax,ay,az=[float(x) for x in vec.strip(" ()").split(",")]
+        elif pl.startswith("gyro"):
+            vec=p.split(":",1)[1].strip(); gx,gy,gz=[float(x) for x in vec.strip(" ()").split(",")]
+        elif pl.startswith("kg"):
+            try: kg=float(p.split(":",1)[1].strip())
+            except: pass
+        else:
+            m=vb_re.search(p);   vbat = float(m.group(1)) if (m and vbat is None) else vbat
+            m=soc_re.search(p);  soc  = float(m.group(1)) if (m and soc  is None) else soc
+            m=pct_re.search(p);  soc  = float(m.group(1)) if (m and soc  is None) else soc
+            m=st1_re.search(p);  state= m.group(1)        if (m and state is None) else state
+            m=st2_re.search(p);  state= m.group(1)        if (m and state is None) else state
+    if None in (ax,ay,az,gx,gy,gz): return None
+    return ax,ay,az,gx,gy,gz,kg,vbat,soc,state
+
+def parse_battery_line(line):
+    """Парсит *отдельную* строку батареи. Возвращает (vbat,soc,state) или None."""
+    L=line.lower()
+    if ("vbat" in L) or ("soc" in L) or (("%" in L) and ("v" in L)):
+        vbat=soc=state=None
+        m=vb_re.search(line);  vbat = float(m.group(1)) if m else None
+        m=soc_re.search(line); soc  = float(m.group(1)) if m else None
+        if soc is None:
+            m=pct_re.search(line); soc = float(m.group(1)) if m else None
+        m=st1_re.search(line); state = m.group(1) if m else None
+        if state is None:
+            m=st2_re.search(line); state = m.group(1) if m else None
+        if (vbat is not None) or (soc is not None) or (state is not None):
+            return vbat,soc,state
+    return None
+
+def update(dt):
+    global last_ts, bx, by, bz, q_ref, yaw_zero, roll_zero, pitch_zero
+    global calib_active, calib_t, cal_gx, cal_gy, cal_gz, cal_n
+    global gx_dps_glob, gy_dps_glob, gz_dps_glob, gmag_lpf, aerr_lpf
+    global stationary_state, still_timer, settle_timer
+    global force_latest, vbat_latest, soc_latest, batt_state
+
+    line = None
+    while lines: line = lines.popleft()
+    if line is None: return
+
+    # пробуем как "основную" IMU-строку
+    parsed = parse_main_line(line)
+    if parsed is None:
+        # если это отдельная батарейная строка — просто обновим индикатор и выходим
+        b = parse_battery_line(line)
+        if b is not None:
+            v,s,st=b
+            if v is not None: vbat_latest=v
+            if s is not None: soc_latest=s
+            if st is not None: batt_state=st
+        return
+
+    ax, ay, az, gx_raw, gy_raw, gz_raw, kg, vbat, soc, state = parsed
+    if kg   is not None: force_latest = kg
+    if vbat is not None: vbat_latest  = vbat
+    if soc  is not None: soc_latest   = soc
+    if state is not None: batt_state  = state
+
+    now = time.perf_counter()
+    if last_ts is None:
+        last_ts = now; return
+    dT = now - last_ts
+    last_ts = now
+    if dT <= 0.0: dT = 1e-6
+
+    # калибровка гиры по кнопке C
+    if calib_active:
+        calib_t += dT
+        cal_gx += gx_raw; cal_gy += gy_raw; cal_gz += gz_raw; cal_n += 1
+        if calib_t >= 3.0 and cal_n > 0:
+            bx = cal_gx / cal_n
+            by = cal_gy / cal_n
+            bz = cal_gz / cal_n
+            q_ref = quat_norm(ahrs.quat())
+            yaw_zero = roll_zero = pitch_zero = 0.0
+            calib_active = False
+
+    # детектор покоя
+    gmag = math.sqrt(gx_raw*gx_raw + gy_raw*gy_raw + gz_raw*gz_raw)
+    gnorm = math.sqrt(ax*ax + ay*ay + az*az)
+    aerr = abs(gnorm - 9.81)
+    alpha_g = math.exp(-dT / ST_GMAG_TAU)
+    alpha_a = math.exp(-dT / ST_AERR_TAU)
+    gmag_lpf = alpha_g * gmag_lpf + (1 - alpha_g) * gmag
+    aerr_lpf = alpha_a * aerr_lpf + (1 - alpha_a) * aerr
+
+    if not stationary_state:
+        if (gmag_lpf < ST_GMAG_THR) and (aerr_lpf < ST_AERR_THR):
+            still_timer += dT
+            if still_timer >= ST_DWELL_SEC:
+                stationary_state = True
+                settle_timer = ST_SETTLE_SEC
+        else:
+            still_timer = 0.0
+    else:
+        if (gmag_lpf >= ST_GMAG_THR*1.3) or (aerr_lpf >= ST_AERR_THR*1.3):
+            stationary_state = False
+            still_timer = 0.0
+        else:
+            still_timer += dT
+            if settle_timer > 0.0:
+                settle_timer -= dT
+                if settle_timer < 0.0: settle_timer = 0.0
+
+    # адаптивные биасы
+    qw,qx,qy,qz = ahrs.quat()
+    sinp = 2.0*(qw*qy - qz*qx)
+    pitch_est = (math.copysign(math.pi/2, sinp) if abs(sinp)>=1.0 else math.asin(sinp))
+    pitch_est_deg = math.degrees(pitch_est)
+    _, pitch_acc_deg = accel_to_rp_deg(ax, ay, az)
+    pitch_err = abs(pitch_acc_deg - pitch_est_deg)
+
+    eta_x = (ETA_Q_X if stationary_state else ETA_M_X)
+    eta_z = (ETA_Q_Z if stationary_state else ETA_M_Z)
+    beta_x = 1.0 - math.exp(-eta_x * dT)
+    beta_z = 1.0 - math.exp(-eta_z * dT)
+    bx += beta_x * (gx_raw - bx)
+    bz += beta_z * (gz_raw - bz)
+
+    if stationary_state and (settle_timer == 0.0) and (abs(gx_raw) < AX_GUARD_XZ) and (abs(gz_raw) < AX_GUARD_XZ) and (pitch_err < PITCH_ERR_MAX):
+        eta_y = ETA_Q_Y
+    else:
+        eta_y = ETA_M_Y_TINY
+    beta_y = 1.0 - math.exp(-eta_y * dT)
+    by += beta_y * (gy_raw - by)
+
+    # мёртвые зоны
+    gx_dps = gx_raw - bx; gy_dps = gy_raw - by; gz_dps = gz_raw - bz
+    if abs(gx_dps)<DEADBAND_X: gx_dps=0.0
+    if abs(gy_dps)<DEADBAND_Y: gy_dps=0.0
+    if abs(gz_dps)<DEADBAND_Z: gz_dps=0.0
+    gx_dps_glob, gy_dps_glob, gz_dps_glob = gx_dps, gy_dps, gz_dps
+
+    # Mahony
+    moving = (gmag_lpf >= ST_GMAG_THR*1.2)
+    ahrs.Kp = KP_ACTIVE if moving else KP_QUIET
+    ahrs.Ki = KI_BASE
+    ahrs.update_imu(math.radians(gx_dps), math.radians(gy_dps), math.radians(gz_dps), ax, ay, az, dT)
+
+    # мягкое авто-«ноль» X/Y в покое
+    if stationary_state and (settle_timer == 0.0) and (still_timer >= (ST_DWELL_SEC + RECENTER_DELAY)):
+        q_rel = quat_norm(quat_mul(quat_conj(q_ref), ahrs.quat()))
+        r_rel, p_rel, _ = quat_to_euler_deg(q_rel)
+        def approach_angle(curr, target, rate, dt):
+            err = wrap_angle_deg(target - curr)
+            return curr + rate * err * dt
+        roll_zero  = approach_angle(roll_zero,  r_rel, RECENTER_RATE, dT)
+        pitch_zero = approach_angle(pitch_zero, p_rel, RECENTER_RATE, dT)
+
+
+# ---------- [11] Запуск ----------
+print(f"Opening {PREFERRED_PORT} @ {BAUD}…")
+threading.Thread(target=serial_reader, daemon=True).start()
+pyglet.clock.schedule_interval(update, 1/200.0)
+pyglet.app.run()
+run_reader = False
